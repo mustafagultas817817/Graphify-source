@@ -18,8 +18,8 @@ from graphify.extractors.base import _file_stem, _make_id, _read_source_bytes
 # and CREATE PROCEDURE [dbo].[usp_Load] ... are both recovered. A bare [\w$.]+
 # stops dead at the leading delimiter, which silently dropped every quoted
 # PL/pgSQL routine (#2180) and every bracket-named T-SQL procedure. T-SQL's
-# AS BEGIN...END body idiom always lands in recovery — the grammar has no
-# create_procedure parse for it — and T-SQL spells re-creation CREATE OR ALTER
+# AS BEGIN...END body idiom lands in recovery (from tree-sitter-sql 0.3.12 it
+# may also partially parse; see #5236 below) — and T-SQL spells re-creation CREATE OR ALTER
 # (it has no OR REPLACE), so accept that form too, mirroring fb_proc_or_trigger.
 # Inside a bracket-delimited part, a literal ] is escaped by doubling
 # ([a]]b] names the identifier a]b), so consume ]] before treating a
@@ -1233,6 +1233,21 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
             fn_name = m.group(1)
             fn_line = src_text[: m.start()].count("\n") + 1
             fn_nid = _make_id(stem, fn_name)
+            # From tree-sitter-sql 0.3.12 a T-SQL header can partially parse as
+            # create_procedure with a misread name: unparenthesised params are
+            # absorbed (`p @x INT`) or taken as the name (`INT`), and a ""/]]
+            # escape truncates it. The walk then minted a second routine with
+            # the wrong id and its own copy of the edges (#5236). A walk routine
+            # on this CREATE's line under another id is that misread: drop it
+            # and its edges, and let this match own the node and re-derive refs.
+            for dup in [nid for nid, ln in structured_routine_lines.items()
+                        if ln == fn_line and nid != fn_nid]:
+                nodes[:] = [n for n in nodes if n["id"] != dup]
+                edges[:] = [e for e in edges if e["source"] != dup and e["target"] != dup]
+                structured_routine_lines.pop(dup)
+                for key in [k for k, v in routine_nids.items() if v == dup]:
+                    del routine_nids[key]
+                seen_ids.discard(dup)
             # A routine the tree already produced (a cleanly parsed function)
             # keeps its tree-based reads_from; scanning it too would double them.
             from_tree = fn_nid in seen_ids
